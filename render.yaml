@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: ozon-analytics
+    env: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: gunicorn backend.main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ozon-analytics-db
+          property: connectionString
+      - key: OZON_ENCRYPTION_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: PYTHON_VERSION
+        value: "3.13.2"
+
+databases:
+  - name: ozon-analytics-db
+    databaseName: ozon_analytics
+    ipAllowList: []

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+envs/
+
+# Environment
+.env
+data/.encryption_key
+
+# Database
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
