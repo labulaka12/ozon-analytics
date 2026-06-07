@@ -9,10 +9,79 @@ services:
         fromDatabase:
           name: ozon-analytics-db
           property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: ozon-analytics-redis
+          type: redis
+          property: connectionString
+      - key: ENV
+        value: production
       - key: OZON_ENCRYPTION_KEY
+        sync: false
+      - key: OZON_JWT_SECRET
         sync: false
       - key: CORS_ORIGINS
         value: "*"
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRO_PRICE_ID
+        sync: false
+      - key: STRIPE_ENTERPRISE_PRICE_ID
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: TRIAL_DAYS
+        value: "14"
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "60"
+      - key: PYTHON_VERSION
+        value: "3.13.2"
+
+  - type: worker
+    name: ozon-analytics-worker
+    env: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python backend/scheduler_worker.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ozon-analytics-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: ozon-analytics-redis
+          type: redis
+          property: connectionString
+      - key: ENV
+        value: production
+      - key: OZON_ENCRYPTION_KEY
+        sync: false
+      - key: OZON_JWT_SECRET
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
       - key: PYTHON_VERSION
         value: "3.13.2"
 
@@ -20,3 +89,8 @@ databases:
   - name: ozon-analytics-db
     databaseName: ozon_analytics
     ipAllowList: []
+
+  - type: redis
+    name: ozon-analytics-redis
+    ipAllowList: []
+    plan: starter

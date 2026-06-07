@@ -1,0 +1,28 @@
+sequenceDiagram
+    participant User
+    participant FE as 前端 (index.html)
+    participant API as FastAPI (main.py)
+    participant Sync as scheduler.py
+    participant DB as SQLite
+    participant Ozon as OzonClient
+
+    User->>FE: 点击"同步订单"
+    FE->>API: POST /api/sync/orders {store_id, date_from, date_to}
+    API->>DB: 查询 Store + 解密 api_key
+    API->>Sync: background_tasks.add_task(sync_orders_for_store, store_id, date_from, date_to)
+    API-->>FE: {"message": "订单同步后台任务已触发"}
+    FE->>User: 显示"同步中..."
+    
+    Sync->>Ozon: get_fbo_orders(since, to)
+    Ozon-->>Sync: FBO 订单列表 (含 financial_data)
+    Sync->>Ozon: get_fbs_orders(since, to)
+    Ozon-->>Sync: FBS 订单列表 (含 financial_data)
+    
+    loop 每笔订单
+        Sync->>DB: UPSERT Order (UniqueConstraint 防重复)
+    end
+    
+    Sync->>DB: INSERT SyncLog (success)
+    FE->>API: GET /api/sync/logs?store_id=X&limit=1
+    API-->>FE: [{status: "success", message: "Processed N orders"}]
+    FE->>User: 显示"同步完成: N 笔订单"

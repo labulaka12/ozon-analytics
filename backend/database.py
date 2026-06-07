@@ -49,5 +49,31 @@ def get_db():
 
 
 def init_db():
-    from models import Store, Product, AnalyticsDaily  # noqa: F401
+    """初始化数据库 — 生产环境使用 Alembic 迁移，开发环境使用 create_all
+
+    检测逻辑：
+    1. 如果存在 alembic 目录且 DATABASE_URL 为 PostgreSQL → 运行 Alembic upgrade
+    2. 否则 → create_all（开发模式 SQLite / 兼容旧部署）
+    """
+    from models import Store, Product, AnalyticsDaily, SyncLog, User, Order, FinanceTransaction, RealizationReport, ProductCost, ManualExpense, ExchangeRate, AlertRule, Plan, Subscription, PaymentHistory, Usage, AuditLog  # noqa: F401
+
+    # 先用 create_all 确保所有表存在（幂等操作）
     Base.metadata.create_all(bind=engine)
+
+    # 如果是 PostgreSQL 且有 Alembic 配置，同步 stamp 到最新版本
+    if os.environ.get("DATABASE_URL", "").startswith("postgresql"):
+        _alembic_cfg = os.path.join(os.path.dirname(__file__), "alembic.ini")
+        if os.path.exists(_alembic_cfg):
+            try:
+                from alembic.config import Config
+                from alembic import command
+                import logging
+                logger = logging.getLogger(__name__)
+                alembic_cfg = Config(_alembic_cfg)
+                alembic_cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "alembic"))
+                # stamp 而非 upgrade：表已由 create_all 创建，只需标记版本
+                command.stamp(alembic_cfg, "head")
+                logger.info("Database tables ensured & Alembic stamped to head.")
+                return
+            except ImportError:
+                pass  # alembic 未安装，忽略

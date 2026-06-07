@@ -1,0 +1,80 @@
+name: Ozon Analytics CI/CD
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    """运行测试"""
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ozon_test
+          POSTGRES_PASSWORD: ozon_test_pass
+          POSTGRES_DB: ozon_analytics_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install -r backend/requirements.txt
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql://ozon_test:ozon_test_pass@localhost:5432/ozon_analytics_test
+          OZON_JWT_SECRET: test-jwt-secret-for-ci
+          OZON_ENCRYPTION_KEY: c2VjcmV0LWtleS1mb3ItY2ktZW5jcnlwdGlvbg==
+          ENV: test
+        run: |
+          cd backend
+          python -m pytest tests/ -v --tb=short
+
+  deploy:
+    """部署到服务器（仅 main/master push 时）"""
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            cd /opt/ozon-analytics
+            git pull origin main
+            /opt/ozon-analytics/venv/bin/pip install -r backend/requirements.txt --quiet
+            cd backend
+            /opt/ozon-analytics/venv/bin/alembic upgrade head
+            sudo systemctl restart ozon-analytics-web
+            sudo systemctl restart ozon-analytics-scheduler
+            echo "Deploy completed at $(date)"

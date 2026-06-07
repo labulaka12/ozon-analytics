@@ -1,0 +1,67 @@
+/* ========== Ozon Analytics 设计系统 ========== */
+/* 从原有 index.html 提取的 CSS 变量 */
+
+:root {
+  /* 主色 */
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --primary-light: #eff6ff;
+  --primary-bg: #dbeafe;
+
+  /* 语义色 */
+  --success: #10b981;
+  --success-light: #d1fae5;
+  --warning: #f59e0b;
+  --warning-light: #fef3c7;
+  --danger: #ef4444;
+  --danger-light: #fee2e2;
+  --info: #3b82f6;
+  --info-light: #dbeafe;
+
+  /* 灰色阶 */
+  --bg: #f0f4f8;
+  --bg-card: #ffffff;
+  --text: #1e293b;
+  --text-secondary: #64748b;
+  --text-muted: #94a3b8;
+  --border: #e2e8f0;
+  --border-light: #f1f5f9;
+
+  /* 布局 */
+  --sidebar-width: 220px;
+  --header-height: 56px;
+  --radius: 8px;
+  --radius-lg: 12px;
+
+  /* 阴影 */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.07), 0 2px 4px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1);
+
+  /* 过渡 */
+  --transition: 0.2s ease;
+
+  /* ===== 兼容别名（组件使用 --color-* 命名风格） ===== */
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-bg: var(--primary-bg);
+  --color-primary-light: var(--primary-light);
+  --color-success: var(--success);
+  --color-success-bg: var(--success-light);
+  --color-warning: var(--warning);
+  --color-warning-bg: var(--warning-light);
+  --color-danger: var(--danger);
+  --color-danger-bg: var(--danger-light);
+  --color-info: var(--info);
+  --color-info-bg: var(--info-light);
+  --color-bg: var(--bg);
+  --color-surface: var(--bg-card);
+  --color-text: var(--text);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-tertiary: var(--text-muted);
+  --color-border: var(--border);
+  --color-border-light: var(--border-light);
+  --color-bg-hover: #f1f5f9;
+  --radius-sm: 4px;
+}

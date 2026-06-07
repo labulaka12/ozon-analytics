@@ -2,10 +2,10 @@
 import os
 import logging
 from datetime import datetime, date, timedelta
-from typing import List, Dict
+from typing import Optional, List, Dict
 
 from database import SessionLocal
-from models import Store, Product, AnalyticsDaily, SyncLog
+from models import Store, Product, AnalyticsDaily, SyncLog, Order, FinanceTransaction, RealizationReport, ProductCost, ManualExpense, ExchangeRate
 from ozon_client import OzonClient
 from crypto import decrypt_value
 
@@ -148,6 +148,7 @@ def sync_products_for_store(store_id: int):
             else:
                 db.add(Product(
                     store_id=store_id,
+                    user_id=store.user_id,
                     offer_id=p.get("offer_id", ""),
                     product_id=pid,
                     sku=sku,
@@ -162,9 +163,8 @@ def sync_products_for_store(store_id: int):
                 created += 1
 
         store.last_sync_at = datetime.now()
-        db.commit()
 
-        # 记录同步日志
+        # 记录同步日志 + 统一提交（避免多次 commit/rollback 不一致）
         db.add(SyncLog(store_id=store_id, sync_type="products", status="success",
                        message=f"Updated: {updated}, Created: {created}"))
         db.commit()
@@ -271,6 +271,7 @@ def sync_analytics_for_store(store_id: int, target_date=None, product_ids: List[
 
             data = {
                 "store_id": store_id,
+                "user_id": store.user_id,
                 "product_id": product.product_id,
                 "offer_id": product.offer_id,
                 "sku": sku_val,
@@ -304,8 +305,7 @@ def sync_analytics_for_store(store_id: int, target_date=None, product_ids: List[
 
             processed += 1
 
-        db.commit()
-        # 更新店铺最后同步时间
+        # 更新店铺最后同步时间 + 同步日志（统一提交）
         store.last_sync_at = datetime.now()
         db.add(SyncLog(store_id=store_id, sync_type="analytics", status="success",
                        message=f"Processed {processed} products for {date_str}"))
@@ -360,5 +360,347 @@ def sync_analytics_all_stores():
                 sync_analytics_for_store(store.id)
             except Exception as e:
                 logger.error(f"Analytics sync failed for store {store.name}: {e}")
+    finally:
+        db.close()
+
+
+# ==================== Phase 2: 订单同步 ====================
+
+def _parse_fbo_orders(raw_data: dict, store_id: int, user_id: int) -> list:
+    """解析 FBO 订单数据为 Order 模型数据字典列表"""
+    results = []
+    for posting in raw_data.get("result", []):
+        posting_number = posting.get("posting_number", "")
+        products = posting.get("products", [])
+        for p in products:
+            results.append({
+                "user_id": user_id,
+                "store_id": store_id,
+                "posting_number": posting_number,
+                "order_type": "fbo",
+                "product_id": p.get("product_id", 0),
+                "offer_id": p.get("offer_id", ""),
+                "sku": p.get("sku"),
+                "product_name": p.get("name", ""),
+                "quantity": p.get("quantity", 1),
+                "price": float(p.get("price", "0") or 0),
+                "total_price": float(p.get("total_price", "0") or 0),
+                "status": posting.get("status", ""),
+                "order_created_at": _parse_dt(posting.get("created_at")),
+                "shipped_at": _parse_dt(posting.get("in_process_at")),
+                "delivered_at": _parse_dt(posting.get("delivered_at")),
+                "cancelled_at": _parse_dt(posting.get("cancelled_at")),
+                "commission": 0.0,
+                "payout": 0.0,
+            })
+    return results
+
+
+def _parse_fbs_orders(raw_data: dict, store_id: int, user_id: int) -> list:
+    """解析 FBS 订单数据为 Order 模型数据字典列表"""
+    results = []
+    for posting in raw_data.get("result", []):
+        posting_number = posting.get("posting_number", "")
+        products = posting.get("products", [])
+        for p in products:
+            results.append({
+                "user_id": user_id,
+                "store_id": store_id,
+                "posting_number": posting_number,
+                "order_type": "fbs",
+                "product_id": p.get("product_id", 0),
+                "offer_id": p.get("offer_id", ""),
+                "sku": p.get("sku"),
+                "product_name": p.get("name", ""),
+                "quantity": p.get("quantity", 1),
+                "price": float(p.get("price", "0") or 0),
+                "total_price": float(p.get("total_price", "0") or 0),
+                "status": posting.get("status", ""),
+                "order_created_at": _parse_dt(posting.get("created_at")),
+                "shipped_at": _parse_dt(posting.get("awaiting_delivery_at")),
+                "delivered_at": _parse_dt(posting.get("delivered_at")),
+                "cancelled_at": _parse_dt(posting.get("cancelled_at")),
+                "commission": 0.0,
+                "payout": 0.0,
+            })
+    return results
+
+
+def _parse_dt(val) -> Optional[datetime]:
+    """安全解析日期时间字段"""
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    try:
+        return datetime.strptime(str(val)[:19], "%Y-%m-%dT%H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+
+
+def sync_orders_for_store(store_id: int, date_from: str, date_to: str):
+    """同步 FBO + FBS 订单"""
+    db = SessionLocal()
+    try:
+        store = db.query(Store).filter_by(id=store_id, is_active=True).first()
+        if not store:
+            logger.warning(f"Store {store_id} not found or inactive")
+            return
+
+        client = _make_ozon_client(store)
+        if not client.health_check():
+            db.add(SyncLog(store_id=store_id, user_id=store.user_id, sync_type="orders", status="error",
+                           message="API 连接失败"))
+            db.commit()
+            return
+
+        logger.info(f"Syncing orders for store: {store.name}, {date_from} ~ {date_to}")
+        processed = 0
+
+        # 同步 FBO
+        try:
+            fbo_data = client.get_fbo_orders(date_from, date_to)
+            fbo_rows = _parse_fbo_orders(fbo_data, store_id, store.user_id)
+            for row in fbo_rows:
+                existing = db.query(Order).filter_by(
+                    store_id=store_id,
+                    posting_number=row["posting_number"],
+                    product_id=row["product_id"]
+                ).first()
+                if existing:
+                    for k, v in row.items():
+                        if k not in ("id", "created_at"):
+                            setattr(existing, k, v)
+                else:
+                    db.add(Order(**row))
+                processed += 1
+            logger.info(f"FBO: {len(fbo_rows)} orders processed")
+        except Exception as e:
+            logger.error(f"FBO sync error: {e}")
+
+        # 同步 FBS（支持翻页）
+        page = 1
+        while True:
+            try:
+                fbs_data = client.get_fbs_orders(date_from, date_to, status=None, page=page, page_size=100)
+                fbs_rows = _parse_fbs_orders(fbs_data, store_id, store.user_id)
+                if not fbs_rows:
+                    break
+                for row in fbs_rows:
+                    existing = db.query(Order).filter_by(
+                        store_id=store_id,
+                        posting_number=row["posting_number"],
+                        product_id=row["product_id"]
+                    ).first()
+                    if existing:
+                        for k, v in row.items():
+                            if k not in ("id", "created_at"):
+                                setattr(existing, k, v)
+                    else:
+                        db.add(Order(**row))
+                    processed += 1
+                page += 1
+                if len(fbs_rows) < 100:
+                    break
+            except Exception as e:
+                logger.error(f"FBS sync error: {e}")
+                break
+
+        # 统一提交：订单数据 + 店铺同步时间 + 同步日志
+        store.last_sync_at = datetime.now()
+        db.add(SyncLog(store_id=store_id, user_id=store.user_id, sync_type="orders", status="success",
+                       message=f"Processed {processed} orders"))
+        db.commit()
+        logger.info(f"Orders sync done for {store.name}: {processed} total")
+
+    except Exception as e:
+        db.rollback()
+        db.add(SyncLog(store_id=store_id, user_id=store.user_id, sync_type="orders", status="error",
+                       message=f"Sync failed: {str(e)[:200]}"))
+        db.commit()
+        logger.error(f"Orders sync failed for store {store_id}: {e}", exc_info=True)
+    finally:
+        db.close()
+
+
+def sync_finance_for_store(store_id: int, date_from: str, date_to: str):
+    """同步财务交易明细"""
+    db = SessionLocal()
+    try:
+        store = db.query(Store).filter_by(id=store_id, is_active=True).first()
+        if not store:
+            return
+        client = _make_ozon_client(store)
+        logger.info(f"Syncing finance for store: {store.name}, {date_from} ~ {date_to}")
+
+        processed = 0
+        page = 1
+        while True:
+            data = client.get_finance_transactions(date_from, date_to, page=page, page_size=100)
+            operations = data.get("result", {}).get("operations", [])
+            if not operations:
+                break
+            for op in operations:
+                txn_id = op.get("transaction_id", str(op.get("operation_id", "")))
+                existing = db.query(FinanceTransaction).filter_by(
+                    store_id=store_id, transaction_id=txn_id
+                ).first()
+                row = {
+                    "user_id": store.user_id,
+                    "store_id": store_id,
+                    "transaction_id": txn_id,
+                    "transaction_type": op.get("operation_type", ""),
+                    "amount": float(op.get("amount", "0") or 0),
+                    "currency": op.get("currency_code", "RUB"),
+                    "transaction_date": _parse_dt(op.get("operation_date")),
+                    "posting_number": op.get("posting", {}).get("posting_number", "") if isinstance(op.get("posting"), dict) else "",
+                    "description": op.get("description", ""),
+                }
+                if existing:
+                    for k, v in row.items():
+                        if k not in ("id", "created_at"):
+                            setattr(existing, k, v)
+                else:
+                    db.add(FinanceTransaction(**row))
+                processed += 1
+            page += 1
+            if len(operations) < 100:
+                break
+
+        db.add(SyncLog(store_id=store_id, user_id=store.user_id, sync_type="finance", status="success",
+                       message=f"Processed {processed} transactions"))
+        db.commit()
+        logger.info(f"Finance sync done for {store.name}: {processed} transactions")
+
+    except Exception as e:
+        db.rollback()
+        db.add(SyncLog(store_id=store_id, user_id=store.user_id, sync_type="finance", status="error",
+                       message=f"Sync failed: {str(e)[:200]}"))
+        db.commit()
+        logger.error(f"Finance sync failed for store {store_id}: {e}", exc_info=True)
+    finally:
+        db.close()
+
+
+def sync_realization_for_store(store_id: int, date_from: str, date_to: str):
+    """同步销售实现报告"""
+    db = SessionLocal()
+    try:
+        store = db.query(Store).filter_by(id=store_id, is_active=True).first()
+        if not store:
+            return
+        client = _make_ozon_client(store)
+        logger.info(f"Syncing realization for store: {store.name}, {date_from} ~ {date_to}")
+
+        data = client.get_realization(date_from, date_to)
+        rows = data.get("result", [])
+        if isinstance(rows, dict):
+            rows = rows.get("rows", [])
+
+        processed = 0
+        for r in rows:
+            product_id = r.get("product_id", 0)
+            period_from = r.get("period_from", date_from)
+            period_to = r.get("period_to", date_to)
+            existing = db.query(RealizationReport).filter_by(
+                store_id=store_id, product_id=product_id,
+                period_from=period_from, period_to=period_to
+            ).first()
+            row = {
+                "user_id": store.user_id,
+                "store_id": store_id,
+                "period_from": period_from,
+                "period_to": period_to,
+                "product_id": product_id,
+                "offer_id": r.get("offer_id", ""),
+                "sku": r.get("sku"),
+                "product_name": r.get("product_name", ""),
+                "sold_units": int(r.get("sold_units", 0)),
+                "revenue": float(r.get("revenue", 0)),
+                "commission": float(r.get("commission", 0)),
+                "logistics_cost": float(r.get("logistics_cost", 0)),
+                "marketing_cost": float(r.get("marketing_cost", 0)),
+                "penalty": float(r.get("penalty", 0)),
+                "other_cost": float(r.get("other_cost", 0)),
+                "payout": float(r.get("payout", 0)),
+            }
+            if existing:
+                for k, v in row.items():
+                    if k not in ("id", "created_at"):
+                        setattr(existing, k, v)
+            else:
+                db.add(RealizationReport(**row))
+            processed += 1
+
+        db.add(SyncLog(store_id=store_id, user_id=store.user_id, sync_type="realization", status="success",
+                       message=f"Processed {processed} realization reports"))
+        db.commit()
+        logger.info(f"Realization sync done for {store.name}: {processed} reports")
+
+    except Exception as e:
+        db.rollback()
+        db.add(SyncLog(store_id=store_id, user_id=store.user_id, sync_type="realization", status="error",
+                       message=f"Sync failed: {str(e)[:200]}"))
+        db.commit()
+        logger.error(f"Realization sync failed for store {store_id}: {e}", exc_info=True)
+    finally:
+        db.close()
+
+
+def sync_all_phase2(store_id: int, date_from: str = None, date_to: str = None):
+    """一键同步所有 Phase 2 数据"""
+    if not date_from:
+        date_from = (date.today() - timedelta(days=30)).strftime("%Y-%m-%d")
+    if not date_to:
+        date_to = date.today().strftime("%Y-%m-%d")
+    sync_orders_for_store(store_id, date_from, date_to)
+    sync_finance_for_store(store_id, date_from, date_to)
+    sync_realization_for_store(store_id, date_from, date_to)
+
+
+def sync_orders_all_stores():
+    """定时任务：同步所有活跃店铺的订单（近 2 天）"""
+    date_to = date.today().strftime("%Y-%m-%d")
+    date_from = (date.today() - timedelta(days=2)).strftime("%Y-%m-%d")
+    db = SessionLocal()
+    try:
+        stores = db.query(Store).filter_by(is_active=True).all()
+        for store in stores:
+            try:
+                sync_orders_for_store(store.id, date_from, date_to)
+            except Exception as e:
+                logger.error(f"Orders sync failed for store {store.name}: {e}")
+    finally:
+        db.close()
+
+
+def sync_finance_all_stores():
+    """定时任务：同步所有活跃店铺的财务交易（近 2 天）"""
+    date_to = date.today().strftime("%Y-%m-%d")
+    date_from = (date.today() - timedelta(days=2)).strftime("%Y-%m-%d")
+    db = SessionLocal()
+    try:
+        stores = db.query(Store).filter_by(is_active=True).all()
+        for store in stores:
+            try:
+                sync_finance_for_store(store.id, date_from, date_to)
+            except Exception as e:
+                logger.error(f"Finance sync failed for store {store.name}: {e}")
+    finally:
+        db.close()
+
+
+def sync_realization_all_stores():
+    """定时任务：同步所有活跃店铺的销售实现报告（近 2 天）"""
+    date_to = date.today().strftime("%Y-%m-%d")
+    date_from = (date.today() - timedelta(days=2)).strftime("%Y-%m-%d")
+    db = SessionLocal()
+    try:
+        stores = db.query(Store).filter_by(is_active=True).all()
+        for store in stores:
+            try:
+                sync_realization_for_store(store.id, date_from, date_to)
+            except Exception as e:
+                logger.error(f"Realization sync failed for store {store.name}: {e}")
     finally:
         db.close()

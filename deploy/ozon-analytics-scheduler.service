@@ -1,0 +1,26 @@
+[Unit]
+Description=Ozon Analytics Scheduler Worker
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=ozon
+Group=ozon
+WorkingDirectory=/opt/ozon-analytics/backend
+Environment=PYTHONPATH=/opt/ozon-analytics
+EnvironmentFile=/opt/ozon-analytics/.env
+ExecStart=/opt/ozon-analytics/venv/bin/python scheduler_worker.py
+Restart=always
+RestartSec=10
+
+# 安全限制
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/ozon-analytics /opt/ozon-analytics/data
+PrivateTmp=true
+
+StandardOutput=append:/var/log/ozon-analytics/scheduler.log
+StandardError=append:/var/log/ozon-analytics/scheduler-error.log
+
+[Install]
+WantedBy=multi-user.target

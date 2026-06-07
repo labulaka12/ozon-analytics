@@ -1,0 +1,136 @@
+classDiagram
+    class User {
+        +int id
+        +string email
+        +string hashed_password
+        +bool is_active
+        +datetime created_at
+        +datetime updated_at
+    }
+
+    class Store {
+        +int id
+        +int user_id
+        +string name
+        +string client_id
+        +string api_key
+        +bool is_active
+        +datetime last_sync_at
+        +datetime created_at
+    }
+
+    class Product {
+        +int id
+        +int user_id
+        +int store_id
+        +string offer_id
+        +int product_id
+        +int sku
+        +string name
+        +float price
+        +string status
+    }
+
+    class Order {
+        +int id
+        +int user_id
+        +int store_id
+        +string posting_number
+        +string order_type         "fbo | fbs"
+        +int product_id
+        +string offer_id
+        +int sku
+        +string product_name
+        +int quantity
+        +float price
+        +float total_price
+        +string status
+        +datetime order_created_at
+        +datetime shipped_at
+        +datetime delivered_at
+        +datetime cancelled_at
+        +float commission
+        +float payout
+        +__table_args__  UniqueConstraint(user_id, store_id, posting_number, product_id)
+        +__table_args__  Index(user_store, status, order_created_at)
+    }
+
+    class FinanceTransaction {
+        +int id
+        +int user_id
+        +int store_id
+        +string transaction_id
+        +string transaction_type
+        +float amount
+        +string currency
+        +datetime transaction_date
+        +string posting_number
+        +int product_id
+        +string description
+        +__table_args__  UniqueConstraint(user_id, store_id, transaction_id)
+        +__table_args__  Index(user_store, transaction_date, transaction_type)
+    }
+
+    class RealizationReport {
+        +int id
+        +int user_id
+        +int store_id
+        +date period_from
+        +date period_to
+        +int product_id
+        +string offer_id
+        +int sku
+        +string product_name
+        +int sold_units
+        +float revenue
+        +float commission
+        +float logistics_cost
+        +float marketing_cost
+        +float penalty
+        +float other_cost
+        +float payout
+        +__table_args__  UniqueConstraint(user_id, store_id, period_from, period_to, product_id)
+        +__table_args__  Index(user_store)
+    }
+
+    class ProductCost {
+        +int id
+        +int user_id
+        +int store_id
+        +int product_id
+        +float cost_price
+        +date cost_updated_at
+        +datetime created_at
+        +datetime updated_at
+        +__table_args__  UniqueConstraint(user_id, store_id, product_id)
+    }
+
+    class ManualExpense {
+        +int id
+        +int user_id
+        +int store_id
+        +int product_id          "nullable"
+        +string expense_type
+        +float amount_cny
+        +string description
+        +date expense_date
+        +datetime created_at
+        +datetime updated_at
+    }
+
+    class ExchangeRate {
+        +int id
+        +int user_id
+        +float rate               "default=12.0"
+        +datetime updated_at
+        +__table_args__  UniqueConstraint(user_id)
+    }
+
+    User "1" --> "*" Store
+    Store "1" --> "*" Product
+    Store "1" --> "*" Order
+    Store "1" --> "*" FinanceTransaction
+    Store "1" --> "*" RealizationReport
+    Store "1" --> "*" ManualExpense
+    Product "1" --> "0..1" ProductCost
+    User "1" --> "1" ExchangeRate

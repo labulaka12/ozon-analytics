@@ -17,13 +17,20 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, and_
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict, Field
-from apscheduler.schedulers.background import BackgroundScheduler
-
 from database import init_db, get_db
-from models import Store, Product, AnalyticsDaily, SyncLog
+from models import Store, Product, AnalyticsDaily, SyncLog, User
 from ozon_client import OzonClient
+from auth import router as auth_router, get_current_user
 from crypto import encrypt_value, decrypt_value
-from scheduler import sync_all_stores, sync_analytics_all_stores, sync_products_for_store, sync_analytics_for_store
+from scheduler import sync_all_stores, sync_analytics_all_stores, sync_products_for_store, sync_analytics_for_store, sync_orders_for_store, sync_finance_for_store, sync_realization_for_store, sync_all_phase2
+from routes.orders import router as orders_router
+from routes.profit import router as profit_router
+from routes.settings import router as settings_router
+from routes.profit_engine_routes import router as profit_engine_router
+from routes.alert_routes import router as alert_router
+from routes.subscription_routes import router as subscription_router
+from routes.account_routes import router as account_router
+from routes.admin_routes import router as admin_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -31,16 +38,45 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：启动时初始化DB & 定时器，关闭时停止定时器"""
+    """应用生命周期：启动时初始化DB + SaaS 基础数据"""
     init_db()
-    scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
-    scheduler.add_job(sync_analytics_all_stores, "cron", hour=8, minute=0, id="daily_sync")
-    scheduler.start()
-    logger.info("Scheduler started: daily analytics sync at 08:00")
 
-    app.state.scheduler = scheduler
+    # 校验配置
+    try:
+        from config import validate_config
+        validate_config()
+    except Exception as e:
+        logger.error(f"Config validation failed: {e}")
+
+    # 初始化默认套餐
+    try:
+        from database import SessionLocal
+        from subscription_service import SubscriptionService
+        db = SessionLocal()
+        try:
+            sub_svc = SubscriptionService(db)
+            sub_svc.ensure_default_plans()
+            logger.info("Default plans ensured")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"Failed to initialize default plans: {e}")
+
+    # 注册 Rate Limiting
+    try:
+        from middleware.rate_limit import setup_rate_limiting
+        setup_rate_limiting(app)
+    except Exception as e:
+        logger.error(f"Failed to setup rate limiting: {e}")
+
+    # 注册审计日志中间件
+    try:
+        from middleware.audit_log import AuditLogMiddleware
+        app.add_middleware(AuditLogMiddleware)
+    except Exception as e:
+        logger.error(f"Failed to setup audit middleware: {e}")
+
     yield
-    scheduler.shutdown(wait=False)
 
 
 app = FastAPI(
@@ -49,6 +85,17 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# 注册认证路由
+app.include_router(auth_router)
+app.include_router(orders_router)
+app.include_router(profit_router)
+app.include_router(settings_router)
+app.include_router(profit_engine_router)
+app.include_router(alert_router)
+app.include_router(subscription_router)
+app.include_router(account_router)
+app.include_router(admin_router)
 
 # CORS 配置：从环境变量读取允许的源，未配置则默认仅允许本地访问
 _cors_origins_str = os.environ.get("CORS_ORIGINS", "")
@@ -169,9 +216,9 @@ class SyncLogOut(BaseModel):
 # ==================== 店铺管理 ====================
 
 @app.get("/api/stores", response_model=List[StoreOut])
-def list_stores(db: Session = Depends(get_db)):
-    """获取所有店铺列表"""
-    stores = db.query(Store).all()
+def list_stores(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """获取当前用户的所有店铺列表"""
+    stores = db.query(Store).filter_by(user_id=current_user.id).all()
     result = []
     for s in stores:
         p_count = db.query(func.count(Product.id)).filter_by(store_id=s.id).scalar()
@@ -184,7 +231,7 @@ def list_stores(db: Session = Depends(get_db)):
 
 
 @app.post("/api/stores")
-def create_store(data: StoreCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def create_store(data: StoreCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """绑定新店铺"""
     # 校验 API 连通性（使用用户提交的明文密钥，尚未加密存储）
     _proxy_url = os.environ.get("OZON_PROXY_URL", "")
@@ -192,10 +239,10 @@ def create_store(data: StoreCreate, background_tasks: BackgroundTasks, db: Sessi
     if not client.health_check():
         raise HTTPException(400, "API 连接失败：请检查 Client-Id 和 Api-Key")
 
-    existing = db.query(Store).filter_by(client_id=data.client_id).first()
+    existing = db.query(Store).filter_by(client_id=data.client_id, user_id=current_user.id).first()
     if existing:
         raise HTTPException(400, "该店铺已存在")
-    store = Store(name=data.name, client_id=data.client_id, api_key=encrypt_value(data.api_key))
+    store = Store(name=data.name, client_id=data.client_id, api_key=encrypt_value(data.api_key), user_id=current_user.id)
     db.add(store)
     db.commit()
     db.refresh(store)
@@ -209,9 +256,9 @@ def create_store(data: StoreCreate, background_tasks: BackgroundTasks, db: Sessi
 
 
 @app.put("/api/stores/{store_id}")
-def update_store(store_id: int, data: StoreUpdate, db: Session = Depends(get_db)):
+def update_store(store_id: int, data: StoreUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """更新店铺信息（支持部分更新）"""
-    store = db.query(Store).filter_by(id=store_id).first()
+    store = db.query(Store).filter_by(id=store_id, user_id=current_user.id).first()
     if not store:
         raise HTTPException(404, "店铺不存在")
     if data.name is not None:
@@ -225,13 +272,13 @@ def update_store(store_id: int, data: StoreUpdate, db: Session = Depends(get_db)
 
 
 @app.delete("/api/stores/{store_id}")
-def delete_store(store_id: int, db: Session = Depends(get_db)):
+def delete_store(store_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """删除店铺（及关联数据）"""
-    store = db.query(Store).filter_by(id=store_id).first()
+    store = db.query(Store).filter_by(id=store_id, user_id=current_user.id).first()
     if not store:
         raise HTTPException(404, "店铺不存在")
-    db.query(AnalyticsDaily).filter_by(store_id=store_id).delete()
-    db.query(Product).filter_by(store_id=store_id).delete()
+    db.query(AnalyticsDaily).filter_by(store_id=store_id, user_id=current_user.id).delete()
+    db.query(Product).filter_by(store_id=store_id, user_id=current_user.id).delete()
     db.delete(store)
     db.commit()
     return {"message": "删除成功"}
@@ -240,15 +287,15 @@ def delete_store(store_id: int, db: Session = Depends(get_db)):
 # ==================== 商品管理 ====================
 
 @app.get("/api/products", response_model=List[ProductOut])
-def list_products(store_id: int = Query(...), db: Session = Depends(get_db)):
+def list_products(store_id: int = Query(...), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取指定店铺的商品列表"""
-    return db.query(Product).filter_by(store_id=store_id).order_by(Product.id).all()
+    return db.query(Product).filter_by(store_id=store_id, user_id=current_user.id).order_by(Product.id).all()
 
 
 @app.get("/api/products/{product_id}")
-def get_product(store_id: int, product_id: int, db: Session = Depends(get_db)):
+def get_product(store_id: int, product_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取单个商品详情"""
-    p = db.query(Product).filter_by(store_id=store_id, product_id=product_id).first()
+    p = db.query(Product).filter_by(store_id=store_id, product_id=product_id, user_id=current_user.id).first()
     if not p:
         raise HTTPException(404, "商品不存在")
     return {
@@ -268,6 +315,7 @@ def get_analytics(
     date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
     date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """获取分析数据（支持多商品、日期范围）
 
@@ -282,6 +330,7 @@ def get_analytics(
 
     query = db.query(AnalyticsDaily).filter(
         AnalyticsDaily.store_id == store_id,
+        AnalyticsDaily.user_id == current_user.id,
         AnalyticsDaily.date >= date_from,
         AnalyticsDaily.date <= date_to,
     )
@@ -345,12 +394,14 @@ def get_analytics_summary(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """获取分析数据汇总（支持按商品过滤）"""
     date_from, date_to = resolve_date_range(date_from, date_to, default_days=7)
 
     filters = [
         AnalyticsDaily.store_id == store_id,
+        AnalyticsDaily.user_id == current_user.id,
         AnalyticsDaily.date >= date_from,
         AnalyticsDaily.date <= date_to,
     ]
@@ -395,12 +446,13 @@ def trigger_sync(
     data: SyncRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """手动触发数据同步
 
     sync_type: products | analytics | all
     """
-    store = db.query(Store).filter_by(id=data.store_id).first()
+    store = db.query(Store).filter_by(id=data.store_id, user_id=current_user.id).first()
     if not store:
         raise HTTPException(404, "店铺不存在")
 
@@ -435,6 +487,22 @@ def trigger_sync(
             for d in dates_to_sync:
                 background_tasks.add_task(sync_analytics_for_store, data.store_id, d, data.product_ids)
             return {"message": f"后台同步已触发: 商品 + {len(dates_to_sync)} 天分析数据"}
+        elif sync_type == "orders":
+            df, dt = resolve_date_range(data.target_date, None, default_days=30)
+            background_tasks.add_task(sync_orders_for_store, data.store_id, df, dt)
+            return {"message": f"订单同步已触发: {df} ~ {dt}"}
+        elif sync_type == "finance":
+            df, dt = resolve_date_range(data.target_date, None, default_days=30)
+            background_tasks.add_task(sync_finance_for_store, data.store_id, df, dt)
+            return {"message": f"财务同步已触发: {df} ~ {dt}"}
+        elif sync_type == "realization":
+            df, dt = resolve_date_range(data.target_date, None, default_days=30)
+            background_tasks.add_task(sync_realization_for_store, data.store_id, df, dt)
+            return {"message": f"销售实现报告同步已触发: {df} ~ {dt}"}
+        elif sync_type == "phase2":
+            df, dt = resolve_date_range(data.target_date, None, default_days=30)
+            background_tasks.add_task(sync_all_phase2, data.store_id, df, dt)
+            return {"message": f"Phase 2 全部数据同步已触发: {df} ~ {dt}"}
         else:
             raise HTTPException(400, "不支持的操作类型: " + sync_type)
 
@@ -447,9 +515,9 @@ def trigger_sync(
 
 
 @app.get("/api/sync/logs", response_model=List[SyncLogOut])
-def get_sync_logs(store_id: Optional[int] = None, limit: int = 20, db: Session = Depends(get_db)):
+def get_sync_logs(store_id: Optional[int] = None, limit: int = 20, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取同步日志"""
-    q = db.query(SyncLog)
+    q = db.query(SyncLog).filter_by(user_id=current_user.id)
     if store_id:
         q = q.filter_by(store_id=store_id)
     return q.order_by(SyncLog.created_at.desc()).limit(limit).all()
@@ -466,12 +534,14 @@ def export_csv(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """导出分析数据为 CSV（使用标准 csv 模块，安全处理特殊字符）"""
     date_from, date_to = resolve_date_range(date_from, date_to, default_days=30)
 
     rows = db.query(AnalyticsDaily).filter(
         AnalyticsDaily.store_id == store_id,
+        AnalyticsDaily.user_id == current_user.id,
         AnalyticsDaily.date >= date_from,
         AnalyticsDaily.date <= date_to,
     ).order_by(AnalyticsDaily.date.asc()).all()
@@ -507,7 +577,10 @@ def export_csv(
 # ==================== 静态文件 ====================
 
 import os
-FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
+FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")
+# 如果 dist 不存在，回退到 frontend 源码目录
+if not os.path.exists(FRONTEND_DIR):
+    FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
 os.makedirs(FRONTEND_DIR, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
@@ -517,6 +590,17 @@ app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 def index():
     """首页重定向到看板"""
     from fastapi.responses import FileResponse
+    return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+
+
+@app.get("/static/{full_path:path}")
+def spa_fallback(full_path: str):
+    """SPA fallback: 所有 /static/* 下找不到的路径都返回 index.html，由 Vue Router 处理"""
+    from fastapi.responses import FileResponse
+    requested_file = os.path.join(FRONTEND_DIR, full_path)
+    if os.path.isfile(requested_file):
+        return FileResponse(requested_file)
+    # 文件不存在，返回 index.html 让 Vue Router 处理路由
     return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
 
 

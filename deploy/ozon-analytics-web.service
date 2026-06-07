@@ -1,0 +1,35 @@
+[Unit]
+Description=Ozon Analytics Web Server
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=ozon
+Group=ozon
+WorkingDirectory=/opt/ozon-analytics/backend
+Environment=PYTHONPATH=/opt/ozon-analytics
+EnvironmentFile=/opt/ozon-analytics/.env
+ExecStart=/opt/ozon-analytics/venv/bin/gunicorn main:app \
+  -w 4 \
+  -k uvicorn.workers.UvicornWorker \
+  --bind 127.0.0.1:8848 \
+  --timeout 120 \
+  --max-requests 10000 \
+  --max-requests-jitter 1000 \
+  --access-logfile /var/log/ozon-analytics/access.log \
+  --error-logfile /var/log/ozon-analytics/error.log \
+  --log-level info
+Restart=always
+RestartSec=5
+
+# 安全限制
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/ozon-analytics /opt/ozon-analytics/data
+PrivateTmp=true
+
+StandardOutput=append:/var/log/ozon-analytics/web.log
+StandardError=append:/var/log/ozon-analytics/web-error.log
+
+[Install]
+WantedBy=multi-user.target
